@@ -1,0 +1,53 @@
+struct Uuid {
+    id: vector<u8, 16>,
+}
+
+enum ErrCode: u8 {
+    Ok = 0,
+    NodeNotFound = 1,
+}
+
+enum FlowType: u8 {
+    Unknown = 0,
+    BevTree = 1,
+    Dialog = 2,
+}
+
+packet<100> PacketHB;
+
+request<101> ReqListenNode {
+    id: Uuid,
+}
+
+response<102> RspListenNode {
+    id: Uuid,
+    code: ErrCode,
+    optional tid: u32,
+}
+
+request<103> ReqCancelListen {
+    id: Uuid,
+    tid: u32,
+}
+
+response<104> RspCancelListen {
+    id: Uuid,
+    tid: u32,
+    code: ErrCode,
+}
+
+packet<105> PacketNodePending {
+    pid: Uuid,
+    nid: Uuid,
+}
+
+packet<106> PacketNodeAbort {
+    pid: Uuid,
+    nid: Uuid,
+}
+
+packet<107> PacketNodeDone {
+    pid: Uuid,
+    nid: Uuid,
+    result: bool,
+}
