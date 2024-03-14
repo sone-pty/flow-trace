@@ -7,8 +7,10 @@ use handler::ServeHandler;
 use slog::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use vnpkt::tokio_ext::{io::AsyncReadExt, registry::Registry};
+use vnpkt::{tokio_ext::{io::AsyncReadExt, registry::Registry}, vector::VectorU8};
 use vnsvrbase::tokio_ext::tcp_link::{send_pkt, TcpLink};
+
+use crate::proto::{FlowType, PacketNodeStatus};
 
 mod handler;
 mod proto;
@@ -18,6 +20,56 @@ pub struct TraceServer<T: ExecStatus> {
     closer: tokio::sync::watch::Sender<bool>,
     templates: Arc<RwLock<HashMap<UUIDHashKey, TracerTemplate<T>>>>,
     tracers: Arc<Mutex<HashMap<TracerId, tokio::task::JoinHandle<()>>>>,
+}
+
+#[derive(Default)]
+pub struct Builder {
+    path: String,
+    max_files: usize,
+    limit_lines: usize,
+    log_chan_size: usize,
+}
+
+impl Builder {
+    pub fn with_log_path(mut self, path: &str) -> Self {
+        self.path = path.into();
+        self
+    }
+
+    pub fn with_max_files(mut self, size: usize) -> Self {
+        self.max_files = size;
+        self
+    }
+
+    pub fn with_limit_lines(mut self, lines: usize) -> Self {
+        self.limit_lines = lines;
+        self
+    }
+
+    pub fn with_log_chan_size(mut self, size: usize) -> Self {
+        self.log_chan_size = size;
+        self
+    }
+
+    pub fn build<T: ExecStatus + 'static>(self) -> (Arc<TraceServer<T>>, Arc<Registry<ServeHandler<T>>>, tokio::sync::watch::Receiver<bool>) {
+        let logfile = file_rotate::FileRotate::new(
+            self.path.as_str(),
+            file_rotate::suffix::AppendTimestamp::default(file_rotate::suffix::FileLimit::MaxFiles(self.max_files)),
+            file_rotate::ContentLimit::Lines(self.limit_lines),
+            file_rotate::compression::Compression::None,
+            #[cfg(unix)]
+            None,
+        );
+        let decorator = slog_term::PlainDecorator::new(logfile);
+        let drain = slog::Drain::fuse(slog_term::FullFormat::new(decorator).build());
+        let drain = slog::Drain::fuse(slog_async::Async::new(drain)
+            .chan_size(self.log_chan_size)
+            .overflow_strategy(slog_async::OverflowStrategy::Block)
+            .build());
+        let logger = slog::Logger::root(drain, slog::o!());
+        let (quit_tx, quit_rx) = tokio::sync::watch::channel(false);
+        (Arc::new(TraceServer::new(logger, quit_tx)), Arc::new(Registry::new()), quit_rx)
+    }
 }
 
 pub fn build<F>(f: F, quit_rx: tokio::sync::watch::Receiver<bool>)
@@ -92,7 +144,7 @@ pub async fn main_loop<T: ExecStatus + 'static>(host: &str, tracer: Arc<TraceSer
 }
 
 impl<T: ExecStatus> TraceServer<T> {
-    pub fn new(logger: slog::Logger, quit_tx: tokio::sync::watch::Sender<bool>) -> Self {
+    pub(crate) fn new(logger: slog::Logger, quit_tx: tokio::sync::watch::Sender<bool>) -> Self {
         Self {
             logger,
             closer: quit_tx,
@@ -131,7 +183,7 @@ impl<T: ExecStatus> TraceServer<T> {
         read.get(&UUIDHashKey(id.clone())).is_some_and(|v| v.listen)
     }
 
-    pub fn check_listen(&self, id: &Uuid) {
+    pub(crate) fn check_listen(&self, id: &Uuid) {
         let mut write = self.templates.write().unwrap();
         let Some(tem) = write.get_mut(&UUIDHashKey(id.clone())) else {
             return;
@@ -141,7 +193,7 @@ impl<T: ExecStatus> TraceServer<T> {
         }
     }
 
-    pub fn make_tracer(self: Arc<Self>, id: &Uuid, handle: vnsvrbase::tokio_ext::tcp_link::Handle) -> Option<Tracer<T>> {
+    pub(crate) fn make_tracer(self: Arc<Self>, id: &Uuid, handle: vnsvrbase::tokio_ext::tcp_link::Handle) -> Option<Tracer<T>> {
         let mut write = self.templates.write().unwrap();
         write.get_mut(&UUIDHashKey(id.clone())).map(|v| {
             v.listen = true; 
@@ -149,12 +201,12 @@ impl<T: ExecStatus> TraceServer<T> {
         })
     }
     
-    pub fn add_tracer(&self, id: TracerId, handle: tokio::task::JoinHandle<()>) -> Option<tokio::task::JoinHandle<()>> {
+    pub(crate) fn add_tracer(&self, id: TracerId, handle: tokio::task::JoinHandle<()>) -> Option<tokio::task::JoinHandle<()>> {
         let mut guard = self.tracers.lock().unwrap();
         guard.insert(id, handle)
     }
 
-    pub fn del_tracer(&self, id: &TracerId) -> Option<tokio::task::JoinHandle<()>> {
+    pub(crate) fn del_tracer(&self, id: &TracerId) -> Option<tokio::task::JoinHandle<()>> {
         let mut guard = self.tracers.lock().unwrap();
         guard.remove(id)
     }
@@ -212,10 +264,30 @@ impl<T: ExecStatus> Tracer<T> {
 
             match self.recv.as_mut().unwrap().recv().await {
                 Ok(v) => {
+                    let mut data = Vec::new();
 
+                    if let Err(_) = v.serialize(&mut data) {
+                        warn!(self.tracer.logger, "serialize ExecStatus data failed");
+                    } else {
+                        let Ok(ty) = FlowType::convert_from(<T as ExecStatus>::TY) else {
+                            error!(self.tracer.logger, "invalid TY for ExecStatus: {}", <T as ExecStatus>::TY);
+                            return;
+                        };
+                        
+                        if data.len() > 0xFFFF {
+                            error!(self.tracer.logger, "ExecStatus data out of 0xFFFF");
+                            return;
+                        }
+
+                        let _ = send_pkt!(self.handle, PacketNodeStatus {
+                            ty,
+                            index: v.map(),
+                            data: unsafe { VectorU8::from_unchecked(data) },
+                        });
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    info!(self.tracer.logger, "recv from chan lagged {} items", n);
+                    warn!(self.tracer.logger, "recv from chan lagged {} items", n);
                     continue;
                 }
                 _ => {
@@ -279,7 +351,9 @@ impl Hash for TracerId {
 }
 
 pub trait ExecStatus: Clone + Send {
-    fn map(&self) -> usize;
+    const TY: u8;
+    fn map(&self) -> u32;
+    fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
 }
 
 #[cfg(test)]
@@ -288,7 +362,9 @@ mod tests {
     use uuid::Uuid;
     use vnpkt::packet_id::{PacketId, PacketIdExt};
     use vnutil::io::{ReadExt, WriteExt, WriteTo, ReadFrom};
-    use super::proto::{self, ErrCode, PacketHB, PacketNodeAbort, PacketNodeDone, PacketNodePending, ReqListenNode, RspListenNode};
+    use crate::proto::{FlowType, PacketNodeStatus};
+
+    use super::proto::{self, ErrCode, PacketHB, ReqListenNode, RspListenNode};
 
     #[test]
     fn test_listen_node() {
@@ -310,15 +386,32 @@ mod tests {
                         } else {
                             println!("can't find node for `9034f2b7-9691-4628-8f84-e6caf7a8b00a`");
                         }
-                    } else if pid == <PacketNodePending as PacketId>::PID as _ {
-                        let rsp = PacketNodePending::read_from(&mut conn).unwrap();
-                        println!("In {} tree, node-{} pending", Uuid::from(rsp.pid), Uuid::from(rsp.nid));
-                    } else if pid == <PacketNodeAbort as PacketId>::PID as _ {
-                        let rsp = PacketNodeAbort::read_from(&mut conn).unwrap();
-                        println!("In {} tree, node-{} abort", Uuid::from(rsp.pid), Uuid::from(rsp.nid));
-                    } else if pid == <PacketNodeDone as PacketId>::PID as _ {
-                        let rsp = PacketNodeDone::read_from(&mut conn).unwrap();
-                        println!("In {} tree, node-{} done, result = {}", Uuid::from(rsp.pid), Uuid::from(rsp.nid), rsp.result);
+                    } else if pid == <PacketNodeStatus as PacketId>::PID as _ {
+                        let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
+                        if rsp.ty == FlowType::BevTree {
+                            let ptr = rsp.data.as_ptr();
+                            let len = rsp.data.len();
+                            let span = unsafe { *(std::slice::from_raw_parts(ptr, 16) as *const [u8] as *const [u8; 16]) };
+                            let node = uuid::Uuid::from_bytes(span);
+                            let index = rsp.index.to_be_bytes();
+                            let index = u32::from_le_bytes(index);
+
+                            match index {
+                                0 => {
+                                    println!("node {} pending", node);
+                                }
+                                1 => {
+                                    println!("node {} abort", node);
+                                }
+                                2 => {
+                                    if len > 16 {
+                                        let res = unsafe { std::ptr::read(ptr.add(16)) };
+                                        println!("node {} complete, result = {}", node, res);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     } else if pid == <PacketHB as PacketId>::PID as _ {
                         let _ = PacketHB::read_from(&mut conn).unwrap();
                     }

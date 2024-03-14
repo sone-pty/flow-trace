@@ -36,18 +36,8 @@ response<104> RspCancelListen {
     code: ErrCode,
 }
 
-packet<105> PacketNodePending {
-    pid: Uuid,
-    nid: Uuid,
-}
-
-packet<106> PacketNodeAbort {
-    pid: Uuid,
-    nid: Uuid,
-}
-
-packet<107> PacketNodeDone {
-    pid: Uuid,
-    nid: Uuid,
-    result: bool,
+packet<105> PacketNodeStatus {
+    ty: FlowType,
+    index: u32,
+    data: vector<u8, 0xFFFF>,
 }
