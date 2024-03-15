@@ -2,7 +2,7 @@
 #![feature(lazy_cell)]
 #![feature(async_closure)]
 
-use std::{collections::HashMap, hash::Hash, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}};
+use std::{collections::HashMap, hash::Hash, mem::ManuallyDrop, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}};
 use handler::ServeHandler;
 use slog::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
@@ -225,7 +225,7 @@ impl<T: ExecStatus> TracerTemplate<T> {
     pub fn make_tracer<'a>(&self, handle: vnsvrbase::tokio_ext::tcp_link::Handle, tracer: Arc<TraceServer<T>>) -> Tracer<T> {
         Tracer {
             id: TracerId(self.id.clone(), self.seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-            recv: Some(self.publisher.subscribe()),
+            recv: ManuallyDrop::new(self.publisher.subscribe()),
             handle,
             tracer,
         }
@@ -245,14 +245,16 @@ impl<T: ExecStatus> TracerTemplate<T> {
 
 pub struct Tracer<T: ExecStatus> {
     id: TracerId,
-    recv: Option<tokio::sync::broadcast::Receiver<T>>,
+    recv: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
 }
 
 impl<T: ExecStatus> Drop for Tracer<T> {
     fn drop(&mut self) {
-        self.recv.take().map(|v| drop(v));
+        unsafe {
+            ManuallyDrop::drop(&mut self.recv);
+        }
         self.tracer.check_listen(&self.id.0);
     }
 }
@@ -260,9 +262,7 @@ impl<T: ExecStatus> Drop for Tracer<T> {
 impl<T: ExecStatus> Tracer<T> {
     pub async fn proc(&mut self) {
         loop {
-            if self.recv.is_none() { break; }
-
-            match self.recv.as_mut().unwrap().recv().await {
+            match self.recv.recv().await {
                 Ok(v) => {
                     let mut data = Vec::new();
 
@@ -271,12 +271,12 @@ impl<T: ExecStatus> Tracer<T> {
                     } else {
                         let Ok(ty) = FlowType::convert_from(<T as ExecStatus>::TY) else {
                             error!(self.tracer.logger, "invalid TY for ExecStatus: {}", <T as ExecStatus>::TY);
-                            return;
+                            break;
                         };
                         
                         if data.len() > 0xFFFF {
                             error!(self.tracer.logger, "ExecStatus data out of 0xFFFF");
-                            return;
+                            break;
                         }
 
                         let _ = send_pkt!(self.handle, PacketNodeStatus {
@@ -362,7 +362,7 @@ mod tests {
     use uuid::Uuid;
     use vnpkt::packet_id::{PacketId, PacketIdExt};
     use vnutil::io::{ReadExt, WriteExt, WriteTo, ReadFrom};
-    use crate::proto::{FlowType, PacketNodeStatus};
+    use crate::proto::{FlowType, PacketNodeStatus, ReqCancelListen};
 
     use super::proto::{self, ErrCode, PacketHB, ReqListenNode, RspListenNode};
 
@@ -375,14 +375,23 @@ mod tests {
         let _ = bytes.write_compressed_u64(pkt.pid() as _);
         let _ = pkt.write_to(&mut bytes);
         let _ = conn.write_all(&bytes);
+        let mut tid = 0;
+        let mut cnt = 0;
 
         loop {
+            if cnt == 20 {
+                break;
+            } else {
+                cnt += 1;
+            }
+
             match conn.read_compressed_u64() {
                 Ok(pid) => {
                     if pid == <RspListenNode as PacketId>::PID as _ {
                         let rsp = RspListenNode::read_from(&mut conn).unwrap();
                         if rsp.code == ErrCode::Ok {
                             println!("listen success");
+                            tid = rsp.tid.unwrap();
                         } else {
                             println!("can't find node for `9034f2b7-9691-4628-8f84-e6caf7a8b00a`");
                         }
@@ -421,5 +430,15 @@ mod tests {
                 }
             }
         }
+
+        let close = ReqCancelListen {
+            id: id.clone(),
+            tid,
+        };
+        println!("tid = {}", tid);
+        bytes.clear();
+        let _ = bytes.write_compressed_u64(close.pid() as _);
+        let _ = close.write_to(&mut bytes);
+        let _ = conn.write_all(&bytes);
     }
 }
