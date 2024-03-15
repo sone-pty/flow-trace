@@ -2,7 +2,7 @@
 #![feature(lazy_cell)]
 #![feature(async_closure)]
 
-use std::{collections::HashMap, hash::Hash, mem::ManuallyDrop, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}};
+use std::{collections::HashMap, fmt::Debug, hash::Hash, mem::ManuallyDrop, sync::{atomic::AtomicU32, Arc, Mutex, RwLock}};
 use handler::ServeHandler;
 use slog::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
@@ -231,15 +231,19 @@ impl<T: ExecStatus> TracerTemplate<T> {
         }
     }
 
-    pub fn new(template: Uuid, publisher: tokio::sync::broadcast::Sender<T>) -> Self {
-        Self {
+    pub fn build(template: Uuid, tracer: &TraceServer<T>) -> (Uuid, Sender<T>) {
+        let id = Uuid::new_v4();
+        let (sx, _) = tokio::sync::broadcast::channel(1024);
+        let tracer_template = Self {
             template,
-            id: Uuid::new_v4(),
+            id: id.clone(),
             executor: 0,
-            publisher,
+            publisher: sx.clone(),
             listen: false,
             seed: AtomicU32::new(0),
-        }
+        };
+        tracer.add_tracer_template(tracer_template);
+        (id, Sender(sx))
     }
 }
 
@@ -350,10 +354,19 @@ impl Hash for TracerId {
     }
 }
 
-pub trait ExecStatus: Clone + Send {
+pub trait ExecStatus: Clone + Send + Debug {
     const TY: u8;
     fn map(&self) -> u32;
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
+}
+
+#[repr(transparent)]
+pub struct Sender<T: ExecStatus>(tokio::sync::broadcast::Sender<T>);
+
+impl<T: ExecStatus + 'static> Sender<T> {
+    pub fn send(&self, info: T) -> Result<usize, Box<dyn std::error::Error>> {
+        self.0.send(info).map_err(|e| Box::new(e) as _)
+    }
 }
 
 #[cfg(test)]
@@ -369,7 +382,7 @@ mod tests {
     #[test]
     fn test_listen_node() {
         let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
-        let id: proto::Uuid = Uuid::parse_str("9034f2b7-9691-4628-8f84-e6caf7a8b00a").unwrap().into();
+        let id: proto::Uuid = Uuid::parse_str("646f98cb-a6f3-480f-8e59-e14547da88ee").unwrap().into();
         let pkt = ReqListenNode { id: id.clone() };
         let mut bytes = Vec::<u8>::with_capacity(1024);
         let _ = bytes.write_compressed_u64(pkt.pid() as _);
@@ -392,8 +405,9 @@ mod tests {
                         if rsp.code == ErrCode::Ok {
                             println!("listen success");
                             tid = rsp.tid.unwrap();
+                            tid = u32::from_le_bytes(tid.to_be_bytes());
                         } else {
-                            println!("can't find node for `9034f2b7-9691-4628-8f84-e6caf7a8b00a`");
+                            println!("can't find node for `{}`", Into::<Uuid>::into(rsp.id));
                         }
                     } else if pid == <PacketNodeStatus as PacketId>::PID as _ {
                         let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
