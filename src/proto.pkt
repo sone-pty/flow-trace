@@ -41,3 +41,7 @@ packet<105> PacketNodeStatus {
     index: u32,
     data: vector<u8, 0xFFFF>,
 }
+
+packet<106> PacketExecutorInfo {
+    
+}

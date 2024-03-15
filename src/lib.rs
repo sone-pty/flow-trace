@@ -206,12 +206,12 @@ impl<T: ExecStatus> TraceServer<T> {
         write.remove(&UUIDHashKey(id.clone()))
     }
 
-    pub fn set_tracer_template_executor(&self, id: &Uuid, ptr: usize) -> bool {
+    pub fn set_tracer_template_executor<E: ExecutorInfo>(&self, id: &Uuid, ptr: &E) -> bool {
         let mut write = self.templates.write().unwrap();
         let Some(tem) = write.get_mut(&UUIDHashKey(id.clone())) else {
             return false;
         };
-        tem.executor = ptr;
+        tem.executor = ptr as *const E as _;
         true
     }
 
@@ -267,7 +267,7 @@ pub struct TracerTemplate<T: ExecStatus> {
 }
 
 impl<T: ExecStatus> TracerTemplate<T> {
-    pub fn make_tracer<'a>(
+    pub fn make_tracer(
         &self,
         handle: vnsvrbase::tokio_ext::tcp_link::Handle,
         tracer: Arc<TraceServer<T>>,
@@ -277,7 +277,7 @@ impl<T: ExecStatus> TracerTemplate<T> {
                 self.id.clone(),
                 self.seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
-            recv: ManuallyDrop::new(self.publisher.subscribe()),
+            chan_rx: ManuallyDrop::new(self.publisher.subscribe()),
             handle,
             tracer,
         }
@@ -301,7 +301,7 @@ impl<T: ExecStatus> TracerTemplate<T> {
 
 pub struct Tracer<T: ExecStatus> {
     id: TracerId,
-    recv: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
+    chan_rx: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
 }
@@ -309,7 +309,7 @@ pub struct Tracer<T: ExecStatus> {
 impl<T: ExecStatus> Drop for Tracer<T> {
     fn drop(&mut self) {
         unsafe {
-            ManuallyDrop::drop(&mut self.recv);
+            ManuallyDrop::drop(&mut self.chan_rx);
         }
         self.tracer.check_listen(&self.id.0);
     }
@@ -318,7 +318,7 @@ impl<T: ExecStatus> Drop for Tracer<T> {
 impl<T: ExecStatus> Tracer<T> {
     pub async fn proc(&mut self) {
         loop {
-            match self.recv.recv().await {
+            match self.chan_rx.recv().await {
                 Ok(v) => {
                     let mut data = Vec::new();
 
@@ -429,6 +429,10 @@ impl<T: ExecStatus + 'static> Sender<T> {
     pub fn send(&self, info: T) -> Result<usize, Box<dyn std::error::Error>> {
         self.0.send(info).map_err(|e| Box::new(e) as _)
     }
+}
+
+pub trait ExecutorInfo {
+    fn current_info<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()>;
 }
 
 #[cfg(test)]
