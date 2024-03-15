@@ -1,10 +1,14 @@
 use std::{future::Future, sync::Arc};
+
 use tokio::{io::BufReader, net::tcp::OwnedReadHalf};
 use vnpkt::tokio_ext::registry::{PacketProc, RegistryInit};
 use vnsvrbase::tokio_ext::tcp_link::send_pkt;
-use crate::{ExecStatus, TraceServer};
 
-use super::{proto::{ErrCode, PacketHB, ReqCancelListen, ReqListenNode, RspCancelListen, RspListenNode}, TracerId};
+use super::{
+    proto::{ErrCode, PacketHB, ReqCancelListen, ReqListenNode, RspCancelListen, RspListenNode},
+    TracerId,
+};
+use crate::{ExecStatus, TraceServer};
 
 fn conv_u8_to_uuid(data: &vnpkt::vector::VectorU8<16>) -> uuid::Uuid {
     let mut input = [0u8; 16];
@@ -27,7 +31,7 @@ impl From<super::proto::Uuid> for uuid::Uuid {
 impl From<uuid::Uuid> for super::proto::Uuid {
     fn from(value: uuid::Uuid) -> Self {
         Self {
-            id: conv_uuid_to_u8(&value)
+            id: conv_uuid_to_u8(&value),
         }
     }
 }
@@ -38,11 +42,11 @@ pub struct ServeHandler<T: ExecStatus> {
 }
 
 impl<T: ExecStatus> ServeHandler<T> {
-    pub fn new(handle: vnsvrbase::tokio_ext::tcp_link::Handle, tracer: Arc<TraceServer<T>>) -> Self {
-        Self {
-            handle,
-            tracer,
-        }
+    pub fn new(
+        handle: vnsvrbase::tokio_ext::tcp_link::Handle,
+        tracer: Arc<TraceServer<T>>,
+    ) -> Self {
+        Self { handle, tracer }
     }
 }
 
@@ -58,7 +62,7 @@ impl<T: ExecStatus + 'static> RegistryInit for ServeHandler<T> {
 
 impl<T: ExecStatus> PacketProc<PacketHB> for ServeHandler<T> {
     type Output<'a> = impl Future<Output = std::io::Result<()>> + 'a where Self: 'a;
-    
+
     fn proc(&mut self, pkt: Box<PacketHB>) -> Self::Output<'_> {
         async {
             let _ = send_pkt!(self.handle, pkt);
@@ -78,11 +82,17 @@ impl<T: ExecStatus + 'static> PacketProc<ReqListenNode> for ServeHandler<T> {
                 tid: None,
             };
 
-            if let Some(mut tracer) = self.tracer.clone().make_tracer(&conv_u8_to_uuid(&pkt.id.id), self.handle.clone()) {
+            if let Some(mut tracer) = self
+                .tracer
+                .clone()
+                .make_tracer(&conv_u8_to_uuid(&pkt.id.id), self.handle.clone())
+            {
                 let id = tracer.id.clone();
-                let handle = tokio::spawn(async move { tracer.proc().await; });
+                let handle = tokio::spawn(async move {
+                    tracer.proc().await;
+                });
                 rsp.tid = Some(id.1);
-                
+
                 if let Some(prev) = self.tracer.add_tracer(id, handle) {
                     prev.abort();
                 }
@@ -107,7 +117,10 @@ impl<T: ExecStatus> PacketProc<ReqCancelListen> for ServeHandler<T> {
                 code: ErrCode::Ok,
             };
 
-            if let Some(v) = self.tracer.del_tracer(&TracerId(conv_u8_to_uuid(&pkt.id.id), pkt.tid)) {
+            if let Some(v) = self
+                .tracer
+                .del_tracer(&TracerId(conv_u8_to_uuid(&pkt.id.id), pkt.tid))
+            {
                 v.abort();
             } else {
                 rsp.code = ErrCode::NodeNotFound;
