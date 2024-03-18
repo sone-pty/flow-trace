@@ -38,10 +38,17 @@ response<104> RspCancelListen {
 
 packet<105> PacketNodeStatus {
     ty: FlowType,
+    nid: Uuid,
     index: u32,
-    data: vector<u8, 0xFFFF>,
 }
 
-packet<106> PacketExecutorInfo {
-    
+packet<106> PacketNodeEvent {
+    ty: FlowType,
+    nid: Uuid,
+    index: u32,
+    optional meta: vector<u8, 0xFFFF>,
+}
+
+packet<107> PacketExecutorInfo {
+
 }

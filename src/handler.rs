@@ -8,7 +8,7 @@ use super::{
     proto::{ErrCode, PacketHB, ReqCancelListen, ReqListenNode, RspCancelListen, RspListenNode},
     TracerId,
 };
-use crate::{ExecStatus, TraceServer};
+use crate::{ExecMsg, TraceServer};
 
 fn conv_u8_to_uuid(data: &vnpkt::vector::VectorU8<16>) -> uuid::Uuid {
     let mut input = [0u8; 16];
@@ -36,12 +36,12 @@ impl From<uuid::Uuid> for super::proto::Uuid {
     }
 }
 
-pub struct ServeHandler<T: ExecStatus> {
+pub struct ServeHandler<T: ExecMsg> {
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
 }
 
-impl<T: ExecStatus> ServeHandler<T> {
+impl<T: ExecMsg> ServeHandler<T> {
     pub fn new(
         handle: vnsvrbase::tokio_ext::tcp_link::Handle,
         tracer: Arc<TraceServer<T>>,
@@ -50,7 +50,7 @@ impl<T: ExecStatus> ServeHandler<T> {
     }
 }
 
-impl<T: ExecStatus + 'static> RegistryInit for ServeHandler<T> {
+impl<T: ExecMsg + 'static> RegistryInit for ServeHandler<T> {
     type AsyncRead = BufReader<OwnedReadHalf>;
 
     fn init(register: &mut vnpkt::tokio_ext::registry::Registry<Self>) {
@@ -60,7 +60,7 @@ impl<T: ExecStatus + 'static> RegistryInit for ServeHandler<T> {
     }
 }
 
-impl<T: ExecStatus> PacketProc<PacketHB> for ServeHandler<T> {
+impl<T: ExecMsg> PacketProc<PacketHB> for ServeHandler<T> {
     type Output<'a> = impl Future<Output = std::io::Result<()>> + 'a where Self: 'a;
 
     fn proc(&mut self, pkt: Box<PacketHB>) -> Self::Output<'_> {
@@ -71,7 +71,7 @@ impl<T: ExecStatus> PacketProc<PacketHB> for ServeHandler<T> {
     }
 }
 
-impl<T: ExecStatus + 'static> PacketProc<ReqListenNode> for ServeHandler<T> {
+impl<T: ExecMsg + 'static> PacketProc<ReqListenNode> for ServeHandler<T> {
     type Output<'a> = impl Future<Output = std::io::Result<()>> + 'a where Self: 'a;
 
     fn proc(&mut self, pkt: Box<ReqListenNode>) -> Self::Output<'_> {
@@ -88,9 +88,7 @@ impl<T: ExecStatus + 'static> PacketProc<ReqListenNode> for ServeHandler<T> {
                 .make_tracer(&conv_u8_to_uuid(&pkt.id.id), self.handle.clone())
             {
                 let id = tracer.id.clone();
-                let handle = tokio::spawn(async move {
-                    tracer.proc().await;
-                });
+                let handle = tokio::spawn(async move { tracer.proc().await });
                 rsp.tid = Some(id.1);
 
                 if let Some(prev) = self.tracer.add_tracer(id, handle) {
@@ -106,7 +104,7 @@ impl<T: ExecStatus + 'static> PacketProc<ReqListenNode> for ServeHandler<T> {
     }
 }
 
-impl<T: ExecStatus> PacketProc<ReqCancelListen> for ServeHandler<T> {
+impl<T: ExecMsg> PacketProc<ReqCancelListen> for ServeHandler<T> {
     type Output<'a> = impl Future<Output = std::io::Result<()>> + 'a where Self: 'a;
 
     fn proc(&mut self, pkt: Box<ReqCancelListen>) -> Self::Output<'_> {
