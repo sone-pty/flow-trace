@@ -1,6 +1,5 @@
 use std::{future::Future, sync::Arc};
 
-use slog::info;
 use tokio::{io::BufReader, net::tcp::OwnedReadHalf};
 use vnpkt::tokio_ext::registry::{PacketProc, RegistryInit};
 use vnsvrbase::tokio_ext::tcp_link::send_pkt;
@@ -120,7 +119,6 @@ impl<T: ExecMsg> PacketProc<ReqCancelListen> for ServeHandler<T> {
                 .tracer
                 .del_tracer(&TracerId(conv_u8_to_uuid(&pkt.id.id), pkt.tid))
             {
-                info!(self.tracer.logger, "tracer.{} end", pkt.tid);
                 v.abort();
             } else {
                 rsp.code = ErrCode::NodeNotFound;
