@@ -52,3 +52,8 @@ packet<106> PacketNodeEvent {
 packet<107> PacketExecutorInfo {
 
 }
+
+packet<108> PacketInstanceClose {
+    ty: FlowType,
+    id: Uuid,
+}

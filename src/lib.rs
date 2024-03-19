@@ -1,6 +1,7 @@
 #![feature(impl_trait_in_assoc_type)]
 #![feature(lazy_cell)]
 #![feature(async_closure)]
+#![feature(new_uninit)]
 
 use std::{
     collections::HashMap,
@@ -20,9 +21,10 @@ use vnpkt::{
 };
 use vnsvrbase::tokio_ext::tcp_link::{send_pkt, TcpLink};
 
-use crate::proto::{FlowType, PacketNodeEvent, PacketNodeStatus};
+use crate::proto::{FlowType, PacketInstanceClose, PacketNodeEvent, PacketNodeStatus};
 
 mod handler;
+mod map;
 mod proto;
 
 pub struct TraceServer<T: ExecMsg> {
@@ -320,18 +322,18 @@ impl<T: ExecMsg> Drop for Tracer<T> {
 
 impl<T: ExecMsg> Tracer<T> {
     pub async fn proc(&mut self) -> std::io::Result<()> {
+        let Ok(ty) = FlowType::convert_from(<T as ExecMsg>::TY) else {
+            error!(
+                self.tracer.logger,
+                "invalid TY for ExecStatus: {}",
+                <T as ExecMsg>::TY
+            );
+            return Ok(());
+        };
+
         loop {
             match self.chan_rx.recv().await {
                 Ok(ref v) => {
-                    let Ok(ty) = FlowType::convert_from(<T as ExecMsg>::TY) else {
-                        error!(
-                            self.tracer.logger,
-                            "invalid TY for ExecStatus: {}",
-                            <T as ExecMsg>::TY
-                        );
-                        break;
-                    };
-
                     if v.is_event() {
                         let (uuid, index) = v
                             .map_event()
@@ -370,18 +372,19 @@ impl<T: ExecMsg> Tracer<T> {
                     continue;
                 }
                 _ => {
-                    warn!(self.tracer.logger, "recv from closed chan");
+                    info!(self.tracer.logger, "recv from closed chan");
+                    self.tracer.del_tracer(&self.id);
+                    let _ = send_pkt!(
+                        self.handle,
+                        PacketInstanceClose {
+                            ty,
+                            id: self.id.0.clone().into(),
+                        }
+                    );
                     break;
                 }
             }
         }
-
-        info!(
-            self.tracer.logger,
-            "tracer-{}-{} proc end", self.id.0, self.id.1
-        );
-
-        self.tracer.del_tracer(&self.id);
         Ok(())
     }
 }
@@ -501,7 +504,10 @@ mod tests {
                         let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
                         if rsp.ty == FlowType::BevTree {
                             if rsp.index == 1 {
-                                println!("[status] node {} is pending", Into::<Uuid>::into(rsp.nid));
+                                println!(
+                                    "[status] node {} is pending",
+                                    Into::<Uuid>::into(rsp.nid)
+                                );
                             }
                         }
                     } else if pid == <PacketNodeEvent as PacketId>::PID as _ {
@@ -512,10 +518,16 @@ mod tests {
                                     println!("[event] node {} abort", Into::<Uuid>::into(rsp.nid));
                                 }
                                 2 => {
-                                    println!("[event] node {} done, result = true", Into::<Uuid>::into(rsp.nid));
+                                    println!(
+                                        "[event] node {} done, result = true",
+                                        Into::<Uuid>::into(rsp.nid)
+                                    );
                                 }
                                 3 => {
-                                    println!("[event] node {} done, result = false", Into::<Uuid>::into(rsp.nid));
+                                    println!(
+                                        "[event] node {} done, result = false",
+                                        Into::<Uuid>::into(rsp.nid)
+                                    );
                                 }
                                 _ => {}
                             }
