@@ -7,9 +7,10 @@ use dashmap::DashMap;
 
 pub(crate) struct MapGroup<K, V> {
     group: Box<[DashMap<K, V>]>,
-    capcity: usize,
+    capacity: usize,
 }
 
+#[allow(dead_code)]
 impl<K: Eq + Hash, V> MapGroup<K, V> {
     pub fn new(capcity: usize) -> Self {
         let real = next_power_of_two(capcity);
@@ -21,7 +22,7 @@ impl<K: Eq + Hash, V> MapGroup<K, V> {
                 }
                 group_uninit.assume_init()
             },
-            capcity: real,
+            capacity: real,
         }
     }
 
@@ -68,7 +69,7 @@ impl<K: Eq + Hash, V> MapGroup<K, V> {
     {
         let mut hasher = std::hash::DefaultHasher::new();
         key.hash(&mut hasher);
-        (hasher.finish() as usize & (self.capcity - 1)) as _
+        (hasher.finish() as usize & (self.capacity - 1)) as _
     }
 }
 

@@ -8,10 +8,11 @@ use std::{
     fmt::Debug,
     hash::Hash,
     mem::ManuallyDrop,
-    sync::{atomic::AtomicU32, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicU32, Arc, RwLock},
 };
 
 use handler::ServeHandler;
+use map::MapGroup;
 use slog::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
@@ -30,8 +31,8 @@ mod proto;
 pub struct TraceServer<T: ExecMsg> {
     pub(crate) logger: slog::Logger,
     closer: tokio::sync::watch::Sender<bool>,
-    templates: Arc<RwLock<HashMap<UUIDHashKey, TracerTemplate<T>>>>,
-    tracers: Arc<Mutex<HashMap<TracerId, tokio::task::JoinHandle<std::io::Result<()>>>>>,
+    templates: RwLock<HashMap<UUIDHashKey, TracerTemplate<T>>>,
+    tracers: MapGroup<TracerId, tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
 #[derive(Default)]
@@ -185,8 +186,8 @@ impl<T: ExecMsg> TraceServer<T> {
         Self {
             logger,
             closer: quit_tx,
-            templates: Arc::new(RwLock::new(HashMap::new())),
-            tracers: Arc::new(Mutex::new(HashMap::new())),
+            templates: RwLock::new(HashMap::new()),
+            tracers: MapGroup::new(16),
         }
     }
 
@@ -249,16 +250,14 @@ impl<T: ExecMsg> TraceServer<T> {
         id: TracerId,
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
     ) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
-        let mut guard = self.tracers.lock().unwrap();
-        guard.insert(id, handle)
+        self.tracers.insert(id, handle)
     }
 
     pub(crate) fn del_tracer(
         &self,
         id: &TracerId,
     ) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
-        let mut guard = self.tracers.lock().unwrap();
-        guard.remove(id)
+        self.tracers.remove(id).map(|v| v.1)
     }
 }
 
@@ -460,7 +459,7 @@ pub trait ExecutorInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, net::TcpStream};
+    use std::{io::Write, net::TcpStream, time::Duration};
 
     use uuid::Uuid;
     use vnpkt::packet_id::{PacketId, PacketIdExt};
@@ -471,85 +470,95 @@ mod tests {
 
     #[test]
     fn test_listen_node() {
-        let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
-        let id: proto::Uuid = Uuid::parse_str("cfcca7fb-4bdd-4174-a1f2-9a3ff2500458")
-            .unwrap()
-            .into();
-        let pkt = ReqListenNode { id: id.clone() };
-        let mut bytes = Vec::<u8>::with_capacity(1024);
-        let _ = bytes.write_compressed_u64(pkt.pid() as _);
-        let _ = pkt.write_to(&mut bytes);
-        let _ = conn.write_all(&bytes);
-        let mut tid = 0;
-        let mut cnt = 0;
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            handles.push(std::thread::spawn(|| {
+                let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
+                let id: proto::Uuid = Uuid::parse_str("7f05bb0c-cfc3-4fba-b028-2b863912604a")
+                    .unwrap()
+                    .into();
+                let pkt = ReqListenNode { id: id.clone() };
+                let mut bytes = Vec::<u8>::with_capacity(1024);
+                let _ = bytes.write_compressed_u64(pkt.pid() as _);
+                let _ = pkt.write_to(&mut bytes);
+                let _ = conn.write_all(&bytes);
+                let mut tid = 0;
+                let mut cnt = 0;
 
-        loop {
-            if cnt == 20 {
-                break;
-            } else {
-                cnt += 1;
-            }
+                loop {
+                    if cnt == 20 {
+                        break;
+                    } else {
+                        cnt += 1;
+                    }
 
-            match conn.read_compressed_u64() {
-                Ok(pid) => {
-                    if pid == <RspListenNode as PacketId>::PID as _ {
-                        let rsp = RspListenNode::read_from(&mut conn).unwrap();
-                        if rsp.code == ErrCode::Ok {
-                            println!("listen success");
-                            tid = rsp.tid.unwrap();
-                        } else {
-                            println!("can't find node for `{}`", Into::<Uuid>::into(rsp.id));
-                        }
-                    } else if pid == <PacketNodeStatus as PacketId>::PID as _ {
-                        let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
-                        if rsp.ty == FlowType::BevTree {
-                            if rsp.index == 1 {
-                                println!(
-                                    "[status] node {} is pending",
-                                    Into::<Uuid>::into(rsp.nid)
-                                );
+                    match conn.read_compressed_u64() {
+                        Ok(pid) => {
+                            if pid == <RspListenNode as PacketId>::PID as _ {
+                                let rsp = RspListenNode::read_from(&mut conn).unwrap();
+                                if rsp.code == ErrCode::Ok {
+                                    println!("listen success");
+                                    tid = rsp.tid.unwrap();
+                                } else {
+                                    println!("can't find node for `{}`", Into::<Uuid>::into(rsp.id));
+                                }
+                            } else if pid == <PacketNodeStatus as PacketId>::PID as _ {
+                                let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
+                                if rsp.ty == FlowType::BevTree {
+                                    if rsp.index == 1 {
+                                        println!(
+                                            "[status] node {} is pending",
+                                            Into::<Uuid>::into(rsp.nid)
+                                        );
+                                    }
+                                }
+                            } else if pid == <PacketNodeEvent as PacketId>::PID as _ {
+                                let rsp = PacketNodeEvent::read_from(&mut conn).unwrap();
+                                if rsp.ty == FlowType::BevTree {
+                                    match rsp.index {
+                                        1 => {
+                                            println!("[event] node {} abort", Into::<Uuid>::into(rsp.nid));
+                                        }
+                                        2 => {
+                                            println!(
+                                                "[event] node {} done, result = true",
+                                                Into::<Uuid>::into(rsp.nid)
+                                            );
+                                        }
+                                        3 => {
+                                            println!(
+                                                "[event] node {} done, result = false",
+                                                Into::<Uuid>::into(rsp.nid)
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else if pid == <PacketHB as PacketId>::PID as _ {
+                                let _ = PacketHB::read_from(&mut conn).unwrap();
                             }
                         }
-                    } else if pid == <PacketNodeEvent as PacketId>::PID as _ {
-                        let rsp = PacketNodeEvent::read_from(&mut conn).unwrap();
-                        if rsp.ty == FlowType::BevTree {
-                            match rsp.index {
-                                1 => {
-                                    println!("[event] node {} abort", Into::<Uuid>::into(rsp.nid));
-                                }
-                                2 => {
-                                    println!(
-                                        "[event] node {} done, result = true",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
-                                3 => {
-                                    println!(
-                                        "[event] node {} done, result = false",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
-                                _ => {}
-                            }
+                        _ => {
+                            break;
                         }
-                    } else if pid == <PacketHB as PacketId>::PID as _ {
-                        let _ = PacketHB::read_from(&mut conn).unwrap();
                     }
                 }
-                _ => {
-                    break;
-                }
-            }
+
+                let close = ReqCancelListen {
+                    id: id.clone(),
+                    tid,
+                };
+                println!("tid = {}", tid);
+                bytes.clear();
+                let _ = bytes.write_compressed_u64(close.pid() as _);
+                let _ = close.write_to(&mut bytes);
+                let _ = conn.write_all(&bytes);
+                std::thread::sleep(Duration::from_secs(1));
+            }));
         }
 
-        let close = ReqCancelListen {
-            id: id.clone(),
-            tid,
-        };
-        println!("tid = {}", tid);
-        bytes.clear();
-        let _ = bytes.write_compressed_u64(close.pid() as _);
-        let _ = close.write_to(&mut bytes);
-        let _ = conn.write_all(&bytes);
+        for h in handles {
+            let _ = h.join();
+        }
     }
 }
