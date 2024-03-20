@@ -44,7 +44,7 @@ impl<K: Eq + Hash, V> MapGroup<K, V> {
         self.group[shard].get_mut(key)
     }
 
-    pub fn insert<Q>(&self, key: K, val: V) -> Option<V> 
+    pub fn insert<Q>(&self, key: K, val: V) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -53,7 +53,7 @@ impl<K: Eq + Hash, V> MapGroup<K, V> {
         self.group[shard].insert(key, val)
     }
 
-    pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)> 
+    pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,

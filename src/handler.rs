@@ -1,14 +1,21 @@
 use std::{future::Future, sync::Arc};
 
+use slog::error;
 use tokio::{io::BufReader, net::tcp::OwnedReadHalf};
-use vnpkt::tokio_ext::registry::{PacketProc, RegistryInit};
+use vnpkt::{
+    tokio_ext::registry::{PacketProc, RegistryInit},
+    vector::Vector,
+};
 use vnsvrbase::tokio_ext::tcp_link::send_pkt;
 
 use super::{
     proto::{ErrCode, PacketHB, ReqCancelListen, ReqListenNode, RspCancelListen, RspListenNode},
     TracerId,
 };
-use crate::{ExecMsg, TraceServer};
+use crate::{
+    proto::{FlowType, InstanceFlag, ReqGetAllInstances, RspGetAllInstances},
+    ExecMsg, TraceServer,
+};
 
 fn conv_u8_to_uuid(data: &vnpkt::vector::VectorU8<16>) -> uuid::Uuid {
     let mut input = [0u8; 16];
@@ -57,6 +64,7 @@ impl<T: ExecMsg + 'static> RegistryInit for ServeHandler<T> {
         register.insert::<PacketHB>();
         register.insert::<ReqListenNode>();
         register.insert::<ReqCancelListen>();
+        register.insert::<ReqGetAllInstances>();
     }
 }
 
@@ -125,6 +133,49 @@ impl<T: ExecMsg> PacketProc<ReqCancelListen> for ServeHandler<T> {
             }
 
             let _ = send_pkt!(self.handle, rsp);
+            Ok(())
+        }
+    }
+}
+
+impl<T: ExecMsg> PacketProc<ReqGetAllInstances> for ServeHandler<T> {
+    type Output<'a> = impl Future<Output = std::io::Result<()>> + 'a where Self: 'a;
+
+    fn proc(&mut self, _: Box<ReqGetAllInstances>) -> Self::Output<'_> {
+        async move {
+            let templates: Vec<uuid::Uuid>;
+            let mut idx = 0;
+            let Ok(ty) = FlowType::convert_from(<T as ExecMsg>::TY) else {
+                error!(
+                    self.tracer.logger,
+                    "invalid TY for ExecStatus: {}",
+                    <T as ExecMsg>::TY
+                );
+                return Ok(());
+            };
+
+            {
+                let read = self.tracer.templates.read().unwrap();
+                templates = read.values().map(|v| v.id).collect();
+            }
+
+            while idx < templates.len() {
+                let flags = templates.as_slice()[idx..std::cmp::min(idx + 0xFFFF, templates.len())]
+                    .iter()
+                    .map(|v| InstanceFlag {
+                        id: (*v).into(),
+                        ty,
+                    })
+                    .collect();
+                idx += 0xFFFF;
+                let _ = send_pkt!(
+                    self.handle,
+                    RspGetAllInstances {
+                        instances: unsafe { Vector::from_unchecked(flags) },
+                        end: idx < templates.len(),
+                    }
+                );
+            }
             Ok(())
         }
     }

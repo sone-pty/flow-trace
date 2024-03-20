@@ -13,6 +13,11 @@ enum FlowType: u8 {
     Dialog = 2,
 }
 
+struct InstanceFlag {
+    id: Uuid,
+    ty: FlowType,
+}
+
 packet<100> PacketHB;
 
 request<101> ReqListenNode {
@@ -56,4 +61,11 @@ packet<107> PacketExecutorInfo {
 packet<108> PacketInstanceClose {
     ty: FlowType,
     id: Uuid,
+}
+
+request<109> ReqGetAllInstances {}
+
+response<110> RspGetAllInstances {
+    instances: vector<InstanceFlag, 0xFFFF>,
+    end: bool,
 }
