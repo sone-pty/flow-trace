@@ -4,13 +4,13 @@
 #![feature(new_uninit)]
 
 use std::{
-    collections::HashMap,
     fmt::Debug,
     hash::Hash,
     mem::ManuallyDrop,
-    sync::{atomic::AtomicU32, Arc, RwLock},
+    sync::{atomic::AtomicU32, Arc},
 };
 
+use dashmap::DashMap;
 use handler::ServeHandler;
 use map::MapGroup;
 use slog::{error, info, warn};
@@ -31,7 +31,7 @@ mod proto;
 pub struct TraceServer<T: ExecMsg> {
     pub(crate) logger: slog::Logger,
     closer: tokio::sync::watch::Sender<bool>,
-    templates: RwLock<HashMap<UUIDHashKey, TracerTemplate<T>>>,
+    templates: DashMap<UUIDHashKey, TracerTemplate<T>>,
     tracers: MapGroup<TracerId, tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
@@ -187,7 +187,7 @@ impl<T: ExecMsg> TraceServer<T> {
         Self {
             logger,
             closer: quit_tx,
-            templates: RwLock::new(HashMap::new()),
+            templates: DashMap::new(),
             tracers: MapGroup::new(16),
         }
     }
@@ -201,18 +201,15 @@ impl<T: ExecMsg> TraceServer<T> {
     }
 
     pub fn add_tracer_template(&self, tracer: TracerTemplate<T>) -> Option<TracerTemplate<T>> {
-        let mut write = self.templates.write().unwrap();
-        write.insert(UUIDHashKey(tracer.id), tracer)
+        self.templates.insert(UUIDHashKey(tracer.id), tracer)
     }
 
     pub fn del_tracer_template(&self, id: &Uuid) -> Option<TracerTemplate<T>> {
-        let mut write = self.templates.write().unwrap();
-        write.remove(&UUIDHashKey(id.clone()))
+        self.templates.remove(&UUIDHashKey(id.clone())).map(|v| v.1)
     }
 
     pub fn set_tracer_template_executor<E: ExecutorInfo>(&self, id: &Uuid, ptr: &E) -> bool {
-        let mut write = self.templates.write().unwrap();
-        let Some(tem) = write.get_mut(&UUIDHashKey(id.clone())) else {
+        let Some(mut tem) = self.templates.get_mut(&UUIDHashKey(id.clone())) else {
             return false;
         };
         tem.executor = ptr as *const E as _;
@@ -220,17 +217,19 @@ impl<T: ExecMsg> TraceServer<T> {
     }
 
     pub fn is_listen(&self, id: &Uuid) -> bool {
-        let read = self.templates.read().unwrap();
-        read.get(&UUIDHashKey(id.clone())).is_some_and(|v| v.listen)
+        self.templates.get(&UUIDHashKey(id.clone())).is_some_and(|v| {
+            let guard = v.lock.lock().unwrap();
+            guard.listen
+        })
     }
 
     pub(crate) fn check_listen(&self, id: &Uuid) {
-        let mut write = self.templates.write().unwrap();
-        let Some(tem) = write.get_mut(&UUIDHashKey(id.clone())) else {
+        let Some(tem) = self.templates.get_mut(&UUIDHashKey(id.clone())) else {
             return;
         };
-        if tem.publisher.receiver_count() == 0 {
-            tem.listen = false;
+        let mut guard = tem.lock.lock().unwrap();
+        if guard.publisher.receiver_count() == 0 {
+            guard.listen = false;
         }
     }
 
@@ -239,9 +238,11 @@ impl<T: ExecMsg> TraceServer<T> {
         id: &Uuid,
         handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     ) -> Option<Tracer<T>> {
-        let mut write = self.templates.write().unwrap();
-        write.get_mut(&UUIDHashKey(id.clone())).map(|v| {
-            v.listen = true;
+        self.templates.get_mut(&UUIDHashKey(id.clone())).map(|v| {
+            {
+                let mut guard = v.lock.lock().unwrap();
+                guard.listen = true;
+            }
             v.make_tracer(handle, self.clone())
         })
     }
@@ -262,13 +263,17 @@ impl<T: ExecMsg> TraceServer<T> {
     }
 }
 
+pub(crate) struct LockArea<T: ExecMsg> {
+    pub(crate) publisher: tokio::sync::broadcast::Sender<T>,
+    pub(crate) listen: bool,
+}
+
 pub struct TracerTemplate<T: ExecMsg> {
     pub template: Uuid,
     pub id: Uuid,
     pub executor: usize,
-    publisher: tokio::sync::broadcast::Sender<T>,
-    listen: bool,
     seed: AtomicU32,
+    lock: std::sync::Mutex<LockArea<T>>,
 }
 
 impl<T: ExecMsg> TracerTemplate<T> {
@@ -282,7 +287,7 @@ impl<T: ExecMsg> TracerTemplate<T> {
                 self.id.clone(),
                 self.seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
-            chan_rx: ManuallyDrop::new(self.publisher.subscribe()),
+            chan_rx: ManuallyDrop::new(self.lock.lock().unwrap().publisher.subscribe()),
             handle,
             tracer,
         }
@@ -295,9 +300,8 @@ impl<T: ExecMsg> TracerTemplate<T> {
             template,
             id: id.clone(),
             executor: 0,
-            publisher: sx.clone(),
-            listen: false,
             seed: AtomicU32::new(0),
+            lock: std::sync::Mutex::new(LockArea { publisher: sx.clone(), listen: false })
         };
         tracer.add_tracer_template(tracer_template);
         (id, Sender(sx))
@@ -596,7 +600,7 @@ mod tests {
         for _ in 0..100 {
             handles.push(std::thread::spawn(|| {
                 let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
-                let id: proto::Uuid = Uuid::parse_str("c6e7e8da-1cd8-4680-a515-44a6f8587c66")
+                let id: proto::Uuid = Uuid::parse_str("c4491fa5-ebf4-425d-8dc5-cb36fece1502")
                     .unwrap()
                     .into();
                 let pkt = ReqListenNode { id: id.clone() };

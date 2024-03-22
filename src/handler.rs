@@ -154,11 +154,7 @@ impl<T: ExecMsg> PacketProc<ReqGetAllInstances> for ServeHandler<T> {
                 return Ok(());
             };
 
-            {
-                let read = self.tracer.templates.read().unwrap();
-                templates = read.values().map(|v| v.id).collect();
-            }
-
+            templates = self.tracer.templates.iter().map(|v| v.id).collect();
             while idx < templates.len() {
                 let flags = templates.as_slice()[idx..std::cmp::min(idx + 0xFFFF, templates.len())]
                     .iter()
