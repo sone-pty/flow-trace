@@ -31,7 +31,7 @@ mod proto;
 pub struct TraceServer<T: ExecMsg> {
     pub(crate) logger: slog::Logger,
     closer: tokio::sync::watch::Sender<bool>,
-    templates: DashMap<UUIDHashKey, TracerTemplate<T>>,
+    pub(crate) templates: DashMap<UUIDHashKey, TracerTemplate<T>>,
     tracers: MapGroup<TracerId, tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
@@ -216,11 +216,14 @@ impl<T: ExecMsg> TraceServer<T> {
         true
     }
 
-    pub fn is_listen(&self, id: &Uuid) -> bool {
-        self.templates.get(&UUIDHashKey(id.clone())).is_some_and(|v| {
-            let guard = v.lock.lock().unwrap();
-            guard.listen
-        })
+    pub fn is_listen(&self, id: &Uuid, info: &T) -> bool {
+        self.templates
+            .get(&UUIDHashKey(id.clone()))
+            .is_some_and(|v| {
+                let mut guard = v.lock.lock().unwrap();
+                guard.history.push(info.clone());
+                guard.listen
+            })
     }
 
     pub(crate) fn check_listen(&self, id: &Uuid) {
@@ -266,6 +269,7 @@ impl<T: ExecMsg> TraceServer<T> {
 pub(crate) struct LockArea<T: ExecMsg> {
     pub(crate) publisher: tokio::sync::broadcast::Sender<T>,
     pub(crate) listen: bool,
+    pub(crate) history: Vec<T>,
 }
 
 pub struct TracerTemplate<T: ExecMsg> {
@@ -282,14 +286,19 @@ impl<T: ExecMsg> TracerTemplate<T> {
         handle: vnsvrbase::tokio_ext::tcp_link::Handle,
         tracer: Arc<TraceServer<T>>,
     ) -> Tracer<T> {
+        let (index, chan) = {
+            let guard = self.lock.lock().unwrap();
+            (guard.history.len(), guard.publisher.subscribe())
+        };
         Tracer {
             id: TracerId(
                 self.id.clone(),
                 self.seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
-            chan_rx: ManuallyDrop::new(self.lock.lock().unwrap().publisher.subscribe()),
+            chan_rx: ManuallyDrop::new(chan),
             handle,
             tracer,
+            index,
         }
     }
 
@@ -301,7 +310,11 @@ impl<T: ExecMsg> TracerTemplate<T> {
             id: id.clone(),
             executor: 0,
             seed: AtomicU32::new(0),
-            lock: std::sync::Mutex::new(LockArea { publisher: sx.clone(), listen: false })
+            lock: std::sync::Mutex::new(LockArea {
+                publisher: sx.clone(),
+                listen: false,
+                history: Vec::new(),
+            }),
         };
         tracer.add_tracer_template(tracer_template);
         (id, Sender(sx))
@@ -313,6 +326,7 @@ pub struct Tracer<T: ExecMsg> {
     chan_rx: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
+    index: usize,
 }
 
 impl<T: ExecMsg> Drop for Tracer<T> {
@@ -325,6 +339,42 @@ impl<T: ExecMsg> Drop for Tracer<T> {
 }
 
 impl<T: ExecMsg> Tracer<T> {
+    fn send_info(&self, v: &T, ty: FlowType) -> std::io::Result<()> {
+        if v.is_event() {
+            let (uuid, index) = v
+                .map_event()
+                .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
+            let mut meta = Vec::new();
+            let ret = v.build_event_meta(&mut meta)?;
+            let _ = send_pkt!(
+                self.handle,
+                PacketNodeEvent {
+                    ty,
+                    nid: uuid.clone().into(),
+                    index,
+                    meta: if ret {
+                        Some(unsafe { VectorU8::from_unchecked(meta) })
+                    } else {
+                        None
+                    },
+                }
+            );
+        } else {
+            let (uuid, index) = v
+                .map_status()
+                .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
+            let _ = send_pkt!(
+                self.handle,
+                PacketNodeStatus {
+                    ty,
+                    nid: uuid.clone().into(),
+                    index,
+                }
+            );
+        }
+        Ok(())
+    }
+
     pub async fn proc(&mut self) -> std::io::Result<()> {
         let Ok(ty) = FlowType::convert_from(<T as ExecMsg>::TY) else {
             error!(
@@ -335,41 +385,22 @@ impl<T: ExecMsg> Tracer<T> {
             return Ok(());
         };
 
+        {
+            let template = self
+                .tracer
+                .templates
+                .get(&UUIDHashKey(self.id.0))
+                .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
+            let guard = template.lock.lock().unwrap();
+            for v in &guard.history[0..self.index] {
+                self.send_info(v, ty)?;
+            }
+        }
+
         loop {
             match self.chan_rx.recv().await {
                 Ok(ref v) => {
-                    if v.is_event() {
-                        let (uuid, index) = v
-                            .map_event()
-                            .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
-                        let mut meta = Vec::new();
-                        let ret = v.build_event_meta(&mut meta)?;
-                        let _ = send_pkt!(
-                            self.handle,
-                            PacketNodeEvent {
-                                ty,
-                                nid: uuid.clone().into(),
-                                index,
-                                meta: if ret {
-                                    Some(unsafe { VectorU8::from_unchecked(meta) })
-                                } else {
-                                    None
-                                },
-                            }
-                        );
-                    } else {
-                        let (uuid, index) = v
-                            .map_status()
-                            .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
-                        let _ = send_pkt!(
-                            self.handle,
-                            PacketNodeStatus {
-                                ty,
-                                nid: uuid.clone().into(),
-                                index,
-                            }
-                        );
-                    }
+                    self.send_info(v, ty)?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(self.tracer.logger, "recv from chan lagged {} items", n);
@@ -476,7 +507,7 @@ mod tests {
     #[test]
     fn test_single_client() {
         let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
-        let id: proto::Uuid = Uuid::parse_str("b3325025-f652-46ba-826e-daaed1c8d794")
+        let id: proto::Uuid = Uuid::parse_str("afcea75b-ad24-4ff4-9a85-0971c0c9fa59")
             .unwrap()
             .into();
         let pkt = ReqListenNode { id: id.clone() };
@@ -600,7 +631,7 @@ mod tests {
         for _ in 0..100 {
             handles.push(std::thread::spawn(|| {
                 let mut conn = TcpStream::connect("127.0.0.1:9054").unwrap();
-                let id: proto::Uuid = Uuid::parse_str("c4491fa5-ebf4-425d-8dc5-cb36fece1502")
+                let id: proto::Uuid = Uuid::parse_str("1143b045-c982-4a30-9cb2-e80defda5470")
                     .unwrap()
                     .into();
                 let pkt = ReqListenNode { id: id.clone() };
@@ -612,7 +643,7 @@ mod tests {
                 let mut cnt = 0;
 
                 loop {
-                    if cnt == 20 {
+                    if cnt == 50 {
                         break;
                     } else {
                         cnt += 1;
