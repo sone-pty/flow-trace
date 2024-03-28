@@ -25,6 +25,21 @@ mod handler;
 mod map;
 mod proto;
 
+pub use proto::FlowEvent;
+pub use proto::FlowStatus;
+
+impl From<proto::FlowStatus> for u8 {
+    fn from(value: proto::FlowStatus) -> Self {
+        value.convert_to()
+    }
+}
+
+impl From<proto::FlowEvent> for u8 {
+    fn from(value: proto::FlowEvent) -> Self {
+        value.convert_to()
+    }
+}
+
 pub struct TraceServer<T: ExecMsg> {
     pub(crate) logger: slog::Logger,
     closer: tokio::sync::watch::Sender<bool>,

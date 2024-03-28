@@ -23,11 +23,10 @@ enum FlowStatus: u8 {
 }
 
 enum FlowEvent: u8 {
-    NodeStatusChanged = 0,
-    NodeActivated = 1,
-    BranchSelected = 2,
-    ConditionEvaluated = 3,
-    CustomEvent = 4,
+    NodeActivated = 0,
+    BranchSelected = 1,
+    ConditionEvaluated = 2,
+    CustomEvent = 3,
 }
 
 struct InstanceFlag {
