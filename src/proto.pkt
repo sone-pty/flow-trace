@@ -13,6 +13,23 @@ enum FlowType: u8 {
     Dialog = 2,
 }
 
+enum FlowStatus: u8 {
+    Idle = 0,
+    Running = 1,
+    Succeed = 2,
+    Failed = 3,
+    Abort = 4,
+    Suspend = 5,
+}
+
+enum FlowEvent: u8 {
+    NodeStatusChanged = 0,
+    NodeActivated = 1,
+    BranchSelected = 2,
+    ConditionEvaluated = 3,
+    CustomEvent = 4,
+}
+
 struct InstanceFlag {
     id: Uuid,
     ty: FlowType,
@@ -44,13 +61,13 @@ response<104> RspCancelListen {
 packet<105> PacketNodeStatus {
     ty: FlowType,
     nid: Uuid,
-    index: u32,
+    index: FlowStatus,
 }
 
 packet<106> PacketNodeEvent {
     ty: FlowType,
     nid: Uuid,
-    index: u32,
+    index: FlowEvent,
     optional meta: vector<u8, 0xFFFF>,
 }
 

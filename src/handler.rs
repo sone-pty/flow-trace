@@ -168,7 +168,7 @@ impl<T: ExecMsg> PacketProc<ReqGetAllInstances> for ServeHandler<T> {
                     self.handle,
                     RspGetAllInstances {
                         instances: unsafe { Vector::from_unchecked(flags) },
-                        end: idx < templates.len(),
+                        end: !(idx < templates.len()),
                     }
                 );
             }

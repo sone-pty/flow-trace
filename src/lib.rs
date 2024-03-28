@@ -4,10 +4,7 @@
 #![feature(new_uninit)]
 
 use std::{
-    fmt::Debug,
-    hash::Hash,
-    mem::ManuallyDrop,
-    sync::{atomic::AtomicU32, Arc},
+    collections::HashMap, fmt::Debug, hash::Hash, mem::ManuallyDrop, sync::{atomic::AtomicU32, Arc}
 };
 
 use dashmap::DashMap;
@@ -217,11 +214,14 @@ impl<T: ExecMsg> TraceServer<T> {
     }
 
     pub fn is_listen(&self, id: &Uuid, info: &T) -> bool {
+        let key = UUIDHashKey(id.clone());
         self.templates
-            .get(&UUIDHashKey(id.clone()))
+            .get(&key)
             .is_some_and(|v| {
                 let mut guard = v.lock.lock().unwrap();
-                guard.history.push(info.clone());
+                if !info.is_event() {
+                    guard.history.insert(key, info.clone());
+                }
                 guard.listen
             })
     }
@@ -269,7 +269,7 @@ impl<T: ExecMsg> TraceServer<T> {
 pub(crate) struct LockArea<T: ExecMsg> {
     pub(crate) publisher: tokio::sync::broadcast::Sender<T>,
     pub(crate) listen: bool,
-    pub(crate) history: Vec<T>,
+    pub(crate) history: HashMap<UUIDHashKey, T>,
 }
 
 pub struct TracerTemplate<T: ExecMsg> {
@@ -286,9 +286,9 @@ impl<T: ExecMsg> TracerTemplate<T> {
         handle: vnsvrbase::tokio_ext::tcp_link::Handle,
         tracer: Arc<TraceServer<T>>,
     ) -> Tracer<T> {
-        let (index, chan) = {
+        let (_, chan) = {
             let guard = self.lock.lock().unwrap();
-            (guard.history.len(), guard.publisher.subscribe())
+            ((), guard.publisher.subscribe())
         };
         Tracer {
             id: TracerId(
@@ -298,7 +298,7 @@ impl<T: ExecMsg> TracerTemplate<T> {
             chan_rx: ManuallyDrop::new(chan),
             handle,
             tracer,
-            index,
+            //index,
         }
     }
 
@@ -313,7 +313,7 @@ impl<T: ExecMsg> TracerTemplate<T> {
             lock: std::sync::Mutex::new(LockArea {
                 publisher: sx.clone(),
                 listen: false,
-                history: Vec::new(),
+                history: HashMap::new(),
             }),
         };
         tracer.add_tracer_template(tracer_template);
@@ -326,7 +326,7 @@ pub struct Tracer<T: ExecMsg> {
     chan_rx: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
-    index: usize,
+    //index: usize,
 }
 
 impl<T: ExecMsg> Drop for Tracer<T> {
@@ -351,7 +351,7 @@ impl<T: ExecMsg> Tracer<T> {
                 PacketNodeEvent {
                     ty,
                     nid: uuid.clone().into(),
-                    index,
+                    index: crate::proto::FlowEvent::convert_from(index)?,
                     meta: if ret {
                         Some(unsafe { VectorU8::from_unchecked(meta) })
                     } else {
@@ -368,7 +368,7 @@ impl<T: ExecMsg> Tracer<T> {
                 PacketNodeStatus {
                     ty,
                     nid: uuid.clone().into(),
-                    index,
+                    index: crate::proto::FlowStatus::convert_from(index)?,
                 }
             );
         }
@@ -392,7 +392,7 @@ impl<T: ExecMsg> Tracer<T> {
                 .get(&UUIDHashKey(self.id.0))
                 .ok_or(std::io::Error::from(std::io::ErrorKind::Other))?;
             let guard = template.lock.lock().unwrap();
-            for v in &guard.history[0..self.index] {
+            for v in guard.history.values() {
                 self.send_info(v, ty)?;
             }
         }
@@ -474,8 +474,8 @@ impl Hash for TracerId {
 
 pub trait ExecMsg: Clone + Send + Debug {
     const TY: u8;
-    fn map_status(&self) -> Option<(&uuid::Uuid, u32)>;
-    fn map_event(&self) -> Option<(&uuid::Uuid, u32)>;
+    fn map_status(&self) -> Option<(&uuid::Uuid, u8)>;
+    fn map_event(&self) -> Option<(&uuid::Uuid, u8)>;
     fn is_event(&self) -> bool;
     fn build_event_meta<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<bool>;
 }
@@ -540,27 +540,15 @@ mod tests {
 
                         match rsp.ty {
                             FlowType::BevTree => match rsp.index {
-                                1 => {
+                                crate::proto::FlowStatus::Suspend => {
                                     println!(
-                                        "[status] node {} is pending",
+                                        "[status] node {} is Suspending",
                                         Into::<Uuid>::into(rsp.nid)
                                     );
                                 }
                                 _ => {}
                             },
                             FlowType::Dialog => match rsp.index {
-                                1 => {
-                                    println!(
-                                        "[status] node {} is input...",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
-                                2 => {
-                                    println!(
-                                        "[status] node {} input err",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
                                 _ => {}
                             },
                             FlowType::Unknown => {}
@@ -570,36 +558,9 @@ mod tests {
 
                         match rsp.ty {
                             FlowType::BevTree => match rsp.index {
-                                1 => {
-                                    println!("[event] node {} abort", Into::<Uuid>::into(rsp.nid));
-                                }
-                                2 => {
-                                    println!(
-                                        "[event] node {} done, result = true",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
-                                3 => {
-                                    println!(
-                                        "[event] node {} done, result = false",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
                                 _ => {}
                             },
                             FlowType::Dialog => match rsp.index {
-                                1 => {
-                                    println!(
-                                        "[event] node {} enter Entry",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
-                                2 => {
-                                    println!(
-                                        "[event] node {} enter Page",
-                                        Into::<Uuid>::into(rsp.nid)
-                                    );
-                                }
                                 _ => {}
                             },
                             _ => {}
@@ -665,35 +626,12 @@ mod tests {
                             } else if pid == <PacketNodeStatus as PacketId>::PID as _ {
                                 let rsp = PacketNodeStatus::read_from(&mut conn).unwrap();
                                 if rsp.ty == FlowType::BevTree {
-                                    if rsp.index == 1 {
-                                        println!(
-                                            "[status] node {} is pending",
-                                            Into::<Uuid>::into(rsp.nid)
-                                        );
-                                    }
+
                                 }
                             } else if pid == <PacketNodeEvent as PacketId>::PID as _ {
                                 let rsp = PacketNodeEvent::read_from(&mut conn).unwrap();
                                 if rsp.ty == FlowType::BevTree {
                                     match rsp.index {
-                                        1 => {
-                                            println!(
-                                                "[event] node {} abort",
-                                                Into::<Uuid>::into(rsp.nid)
-                                            );
-                                        }
-                                        2 => {
-                                            println!(
-                                                "[event] node {} done, result = true",
-                                                Into::<Uuid>::into(rsp.nid)
-                                            );
-                                        }
-                                        3 => {
-                                            println!(
-                                                "[event] node {} done, result = false",
-                                                Into::<Uuid>::into(rsp.nid)
-                                            );
-                                        }
                                         _ => {}
                                     }
                                 }
