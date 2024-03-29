@@ -25,21 +25,6 @@ mod handler;
 mod map;
 mod proto;
 
-pub use proto::FlowEvent;
-pub use proto::FlowStatus;
-
-impl From<proto::FlowStatus> for u8 {
-    fn from(value: proto::FlowStatus) -> Self {
-        value.convert_to()
-    }
-}
-
-impl From<proto::FlowEvent> for u8 {
-    fn from(value: proto::FlowEvent) -> Self {
-        value.convert_to()
-    }
-}
-
 pub struct TraceServer<T: ExecMsg> {
     pub(crate) logger: slog::Logger,
     closer: tokio::sync::watch::Sender<bool>,
@@ -228,14 +213,14 @@ impl<T: ExecMsg> TraceServer<T> {
         true
     }
 
-    pub fn is_listen(&self, id: &Uuid, info: &T) -> bool {
+    pub fn is_listen(&self, id: &Uuid, info: &T, node_id: &uuid::Uuid) -> bool {
         let key = UUIDHashKey(id.clone());
         self.templates
             .get(&key)
             .is_some_and(|v| {
                 let mut guard = v.lock.lock().unwrap();
                 if !info.is_event() {
-                    guard.history.insert(key, info.clone());
+                    guard.history.insert(UUIDHashKey(node_id.clone()), info.clone());
                 }
                 guard.listen
             })
@@ -313,7 +298,6 @@ impl<T: ExecMsg> TracerTemplate<T> {
             chan_rx: ManuallyDrop::new(chan),
             handle,
             tracer,
-            //index,
         }
     }
 
@@ -341,7 +325,6 @@ pub struct Tracer<T: ExecMsg> {
     chan_rx: ManuallyDrop<tokio::sync::broadcast::Receiver<T>>,
     handle: vnsvrbase::tokio_ext::tcp_link::Handle,
     tracer: Arc<TraceServer<T>>,
-    //index: usize,
 }
 
 impl<T: ExecMsg> Drop for Tracer<T> {
@@ -366,7 +349,7 @@ impl<T: ExecMsg> Tracer<T> {
                 PacketNodeEvent {
                     ty,
                     nid: uuid.clone().into(),
-                    index: crate::proto::FlowEvent::convert_from(index)?,
+                    index,
                     meta: if ret {
                         Some(unsafe { VectorU8::from_unchecked(meta) })
                     } else {
@@ -383,7 +366,7 @@ impl<T: ExecMsg> Tracer<T> {
                 PacketNodeStatus {
                     ty,
                     nid: uuid.clone().into(),
-                    index: crate::proto::FlowStatus::convert_from(index)?,
+                    index,
                 }
             );
         }
@@ -555,7 +538,7 @@ mod tests {
 
                         match rsp.ty {
                             FlowType::BevTree => match rsp.index {
-                                crate::proto::FlowStatus::Suspend => {
+                                0 => {
                                     println!(
                                         "[status] node {} is Suspending",
                                         Into::<Uuid>::into(rsp.nid)
